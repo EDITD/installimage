@@ -191,7 +191,7 @@ generate_menu() {
       if [ "$UEFI" -eq 1 ]; then
         DEFAULTPARTS="$DEFAULTPARTS\nPART  /boot/efi  esp  256M"
       fi
-      DEFAULTPARTS="$DEFAULTPARTS\nPART  /boot  ext3  512M"
+      DEFAULTPARTS="$DEFAULTPARTS\nPART  /boot  ext3  1024M"
       DEFAULTPARTS="$DEFAULTPARTS\nPART  lvm    vg0    all\n"
       DEFAULTPARTS="$DEFAULTPARTS\nLV  vg0  root  /     ext3  15G"
       DEFAULTPARTS="$DEFAULTPARTS\nLV  vg0  swap  swap  swap   6G"
@@ -389,7 +389,11 @@ create_config() {
       echo "##  MISC CONFIG:"
       echo "## ============="
       echo
-      echo "USE_KERNEL_MODE_SETTING yes"
+      if board_requires_drm_blacklisting; then
+        echo "USE_KERNEL_MODE_SETTING no"
+      else
+        echo "USE_KERNEL_MODE_SETTING yes"
+      fi
     } >> "$CNF"
 
     ## Calculate how much hardisk space at raid level 0,1,5,6,10
@@ -449,7 +453,7 @@ create_config() {
       echo "##"
       echo "## example without LVM (default):"
       echo "## -> 4GB   swapspace"
-      echo "## -> 512MB /boot"
+      echo "## -> 1024MB /boot"
       if [ "$UEFI" -eq 1 ]; then
         echo "## -> 256MB /boot/efi"
       fi
@@ -457,7 +461,7 @@ create_config() {
       echo "## -> 5GB   /tmp"
       echo "## -> all the rest to /home"
       echo "#PART swap   swap        4G"
-      echo "#PART /boot  ext2      512M"
+      echo "#PART /boot  ext2      1024M"
       if [ "$UEFI" -eq 1 ]; then
         echo "#PART /boot/efi  esp          256M"
       fi
@@ -471,9 +475,9 @@ create_config() {
       echo "## example with LVM:"
       echo "#"
       echo "## normal filesystems and volume group definitions:"
-      echo "## -> 512MB boot  (not on lvm)"
+      echo "## -> 1024MB boot  (not on lvm)"
       echo "## -> all the rest for LVM VG 'vg0'"
-      echo "#PART /boot  ext3     512M"
+      echo "#PART /boot  ext3     1024M"
       echo "#PART lvm    vg0       all"
       echo "#"
       echo "## logical volume definitions:"
@@ -501,14 +505,25 @@ create_config() {
 
     } >> "$CNF"
 
-    if [ -x "/usr/local/bin/hwdata" ]; then
-      {
-        echo "#"
-        echo "## your system has the following devices:"
-        echo "#"
-        /usr/local/bin/hwdata | grep "Disk /"  | sed "s/^  /#/"
-      } >> "$CNF"
-    fi
+    {
+      echo "#"
+      echo "## your system has the following devices:"
+      echo "#"
+      for link in /sys/block/*/; do
+        [[ -e "$link" ]] || continue
+        local target="$(readlink -f "$link")"
+        if [[ "$target" =~ ^/sys/devices/virtual/ ]]; then continue; fi
+
+        local dev="/dev/${target##*/}"
+        # do not list unreadable disks
+        dd bs=1 count=1 "if=$dev" of=/dev/null status=none &> /dev/null || continue
+
+        local size="$(blockdev --getsize64 "$dev")"
+        local si_size="$(numfmt --to=si --format="%.2f" "$size")"
+        local iec_i_size="$(numfmt --to=iec-i --format="%.2f" "$size")"
+        echo "# Disk $dev: ${si_size::-1} ${si_size: -1}B (=> ${iec_i_size::-2} ${iec_i_size: -2}B)"
+      done
+    } >> "$CNF"
 
     if [ "$RAID1" ] && [ "$RAID0" ] ; then
       {
@@ -710,6 +725,18 @@ if [ -n "$1" ]; then
   PRESERVE_VG="$(grep -m1 -e ^PRESERVE_VG "$1" |awk '{print $2}')"
   export PRESERVE_VG
 
+  # hidden configure option:
+  # skip mkfs for specified devices
+  # EXAMPLE: PRESEVE_FS /dev/vg0/storage /dev/vg0/another_storage
+  PRESERVE_FS=($(grep -m1 -oP "^PRESERVE_FS\s+\K.+" "$1"))
+  export PRESERVE_FS
+
+  # hidden configure option:
+  # reuse given fstab (path to it) and skip all partioning/raid/etc.
+  # EXAMPLE: REUSE_FSTAB /tmp/fstab
+  REUSE_FSTAB="$(grep -m1 -e ^REUSE_FSTAB "$1" |awk '{print $2}')"
+  export REUSE_FSTAB
+
   # another configure option: allow usb drives
   # if set to 1: allow usb drives
   [[ -z "$ALLOW_USB_DRIVES" ]] && export ALLOW_USB_DRIVES="$(grep -m1 -e ^ALLOW_USB_DRIVES "$1" |awk '{print $2}')"
@@ -780,9 +807,7 @@ if [ -n "$1" ]; then
     if [ "${PART_MOUNT[$i]}" = "/" ]; then
       HASROOT="true"
     fi
-    if [ -n "${PART_CRYPT[$i]}" ]; then
-      export CRYPT="1"
-    fi
+    test -n "${PART_CRYPT[$i]}"; CRYPT=$((1 - $?))
   done < /tmp/part_lines.tmp
 
   # get encryption password
@@ -938,6 +963,16 @@ fi
   :
 }
 
+img_arch_matches_sysarch() {
+  local img_arch="$1"
+  local sysarch="$2"
+  [[ "$img_arch" == "$sysarch" ]] ||
+    [[ "$img_arch" == '32' && "$sysarch" == 'x86_64' ]] ||
+    [[ "$img_arch" == '64' && "$sysarch" == 'x86_64' ]] ||
+    [[ "$img_arch" == 'i386' && "$sysarch" == 'x86_64' ]] ||
+    [[ "$img_arch" == 'amd64' && "$sysarch" == 'x86_64' ]] ||
+    return 1
+}
 
 # validate all variables for correct values
 # validate_vars "CONFIGFILE"
@@ -965,18 +1000,6 @@ validate_vars() {
    return 1
   fi
 
-  if [ "$CRYPT" = "1" ] && [ -z "$CRYPTPASSWORD" ]; then
-    graph_error "ERROR: Value for CRYPTPASSWORD is not defined"
-    return 1
-  fi
-
-  if [ "$CRYPT" = "1" ] && [ "$IAM" = "centos" ]; then
-    if [ "$IMG_VERSION" -lt 70 ] || ((IMG_VERSION == 610)); then
-      graph_error "ERROR: CentOS 7 or higher is needed for encryption!"
-      return 1
-    fi
-  fi
-
   # test if FILETYPE is a supported type
   CHECK="$(echo $IMAGE_FILE_TYPE |grep -i -e "^tar$\|^tgz$\|^tbz$\|^txz$\|^zst$")"
   if [ -z "$CHECK" ]; then
@@ -993,6 +1016,16 @@ validate_vars() {
   fi
   if (( UEFI == 1 )) && rhel_9_based_image; then
     graph_error "ERROR: we do not yet support $IAM $IMG_VERSION on EFI systems"
+    return 1
+  fi
+
+  if [[ "$IMG_ARCH" == 'unknown' ]]; then
+    graph_error "ERROR: can not determine image arch from filename"
+    return 1
+  fi
+
+  if ! img_arch_matches_sysarch "$IMG_ARCH" "$SYSARCH"; then
+    graph_error "ERROR: can not install an $IMG_ARCH image on a $SYSARCH system"
     return 1
   fi
 
@@ -1197,7 +1230,7 @@ validate_vars() {
       # test if the mountpoint is valid (start with / or swap or lvm)
       CHECK="$(echo "${PART_MOUNT[$i]}" | grep -P '^(/\w*|none$|swap$|lvm$|btrfs\.\w+)')"
       if [ -z "$CHECK" ]; then
-        graph_error "ERROR: Mountpoint for partition $i is not correct"
+        graph_error "ERROR: Mountpoint for partition $i is not correct: '${PART_MOUNT[$i]}' is not a valid mountpoint"
         return 1
       fi
 
@@ -1227,6 +1260,21 @@ validate_vars() {
         fi
       fi
 
+      if [ "${PART_FS[$i]}" = "xfs" ]; then
+        if image_requires_xfs_version_check; then
+          if ! [[ "$(mkfs.xfs -V)" =~ ^mkfs\.xfs\ version\ (.*)$ ]]; then
+            graph_error "ERROR: can not query mkfs.xfs version"
+            return 1
+          fi
+          local mkfs_xfs_major_version="${BASH_REMATCH[1]%%.*}"
+          local max_mkfs_xfs_major_version=5
+          if (( mkfs_xfs_major_version > max_mkfs_xfs_major_version )); then
+            graph_error "ERROR: xfs for $IAM $IMG_VERSION is not supported"
+            return 1
+          fi
+        fi
+      fi
+
       # count ESP
       if [ "${PART_FS[$i]}" = "esp" ]; then
         espcount+=1
@@ -1239,11 +1287,12 @@ validate_vars() {
             return 1
           fi
           if [ "${PART_SIZE[$i]}" -lt "256" ]; then
-            graph_error "ERROR: EFI System Partition (ESP) partition has to be at least 256M (current size: ${PART_SIZE[$i]})"
+            graph_error "ERROR: EFI System Partition (ESP) has to be at least 256M (current size: ${PART_SIZE[$i]})"
             return 1
           fi
         fi
-     fi
+        ((UEFI == 0)) && graph_notice "Warning: Creating an EFI System Partition (ESP) on a non UEFI system!"
+      fi
 
       # We can't use bsdtar on non ext2/3/4 partitions because xfs/btrfs can't handle
       # secondary ext-only flags and we can't just extract the xattrs we want with bsdtar.
@@ -1381,6 +1430,21 @@ validate_vars() {
     if [ "$lv_fs" = "reiserfs" -a "$IAM" = "centos" ]; then
       graph_error "ERROR: reiserfs is not supported for CentOS"
       return 1
+    fi
+
+    if [ "$lv_fs" = "xfs" ]; then
+      if image_requires_xfs_version_check; then
+        if ! [[ "$(mkfs.xfs -V)" =~ ^mkfs\.xfs\ version\ (.*)$ ]]; then
+          graph_error "ERROR: can not query mkfs.xfs version"
+          return 1
+        fi
+        local mkfs_xfs_major_version="${BASH_REMATCH[1]%%.*}"
+        local max_mkfs_xfs_major_version=5
+        if (( mkfs_xfs_major_version > max_mkfs_xfs_major_version )); then
+          graph_error "ERROR: xfs for $IAM $IMG_VERSION is not supported"
+          return 1
+        fi
+      fi
     fi
 
     if [ "$lv_size" != "all" ] && [ "$(echo "$lv_size" | sed "s/[0-9]//g")" != "" -o "$lv_size" = "0" ]; then
@@ -1607,6 +1671,18 @@ validate_vars() {
   fi
   # TODO: add check for valid hostname (e.g. no underscores)
 
+  if [ "$CRYPT" = "1" ] && [ -z "$CRYPTPASSWORD" ]; then
+    graph_error "ERROR: Value for CRYPTPASSWORD is not defined"
+    return 1
+  fi
+
+  if [ "$CRYPT" = "1" ] && [ "$IAM" = "centos" ]; then
+    if [ "$IMG_VERSION" -lt 70 ] || ((IMG_VERSION == 610)); then
+      graph_error "ERROR: CentOS 7 or higher is needed for encryption!"
+      return 1
+    fi
+  fi
+
   fi
   return 0
 }
@@ -1682,7 +1758,8 @@ whoami() {
 
  IMG_VERSION="$(echo "$1" | cut -d "-" -f 2)"
  [ -z "$IMG_VERSION" -o "$IMG_VERSION" = "" -o "$IMG_VERSION" = "h.net.tar.gz" -o "$IMG_VERSION" = 'latest' ] && IMG_VERSION="0"
- IMG_ARCH="$(echo "$1" | sed 's/.*-\(32\|64\)-.*/\1/')"
+ IMG_ARCH="$(echo "$1" | sed 's/.*-\(32\|64\|i386\|amd64\|arm64\)-.*/\1/')"
+ if grep -q '-' <<< "$IMG_ARCH"; then IMG_ARCH='unknown'; fi
 
  IMG_FULLNAME="$(find "$IMAGESPATH" -maxdepth 1 -type f -name "$1*" -a -not -regex '.*\.sig$' -printf '%f\n')"
  IMG_EXT="${IMG_FULLNAME#*.}"
@@ -1783,13 +1860,6 @@ stop_lvm_raid() {
 # delete_partitions "DRIVE"
 delete_partitions() {
  if [ "$1" ]; then
-  # clean RAID information for every partition not only for the blockdevice
-  for raidmember in $(sfdisk -l "$1" | grep -o "${1}p\?[0-9]\+"); do
-    mdadm -q --zero-superblock "$raidmember" |& debugoutput
-  done
-  # clean RAID information in superblock of blockdevice
-  mdadm -q --zero-superblock "$1" |& debugoutput
-
   # delete GPT and MBR
   sgdisk -Z "$1" |& debugoutput
 
@@ -1915,7 +1985,7 @@ create_partitions() {
 
   echo "deactivate all dm-devices with dmraid and dmsetup" | debugoutput
   dmsetup remove_all 2>&1 | debugoutput
-  dmraid -a no 2>&1 | debugoutput
+  if command -v dmraid &> /dev/null; then dmraid -a no 2>&1 | debugoutput; fi
 
   dd if=/dev/zero of=$1 bs=1M count=10 status=none |& debugoutput
   hdparm -z $1 |& debugoutput
@@ -2103,7 +2173,7 @@ create_partitions() {
   hdparm -z $1 >/dev/null 2>&1
 
   echo "deactivate all dm-devices with dmraid and dmsetup" | debugoutput
-  dmraid -a no 2>&1 | debugoutput
+  if command -v dmraid &> /dev/null; then dmraid -a no 2>&1 | debugoutput; fi
   dmsetup remove_all 2>&1 | debugoutput
 
   # Dump debug info if partprobe fails
@@ -3669,6 +3739,8 @@ install_robot_report_script() {
       local link_service=1
     elif debian_bullseye_image; then
       local link_service=1
+    elif debian_bookworm_image; then
+      local link_service=1
     else
       local link_service=0
     fi
@@ -3873,6 +3945,12 @@ uuid_bugfix() {
     return 0
 }
 
+disk_serial() {
+  local dev="$1"
+  smartctl_json="$(smartctl -i -j "$dev" 2> /dev/null)" || return "$?"
+  jq -r '.serial_number // empty' <<< "$smartctl_json" 2> /dev/null
+}
+
 # param 1: /dev/sda (e.g)
 function hdinfo() {
   local dev="$(readlink -f "$1")"
@@ -3880,7 +3958,7 @@ function hdinfo() {
   local vendor;
   local name;
   local logical_nr;
-  withoutdev=${dev##*/}
+  withoutdev="${dev##*/}"
   if [ -e "/sys/block/$withoutdev/device/vendor" ]; then
     vendor="$(tr -d ' ' < "/sys/block/$withoutdev/device/vendor")"
   fi
@@ -3888,27 +3966,27 @@ function hdinfo() {
   case "$vendor" in
     LSI)
       logical_nr="$(find "/sys/block/$withoutdev/device/scsi_device/*" -maxdepth 0 -type d | cut -d: -f3)"
-      name="$(megacli -ldinfo -L"$logical_nr" -aall | grep Name | cut -d: -f2)"
-      [ -z "$name" ] && name="no name"
-      echo "# LSI RAID (LD $logical_nr): $name"
+      name="$(megacli -ldinfo -L"$logical_nr" -aall 2> /dev/null | grep Name | cut -d: -f2)"
+      echo "# LSI RAID (LD $logical_nr): ${name:-no name}"
       ;;
     Adaptec)
       logical_nr="$(awk '{print $2}' < "/sys/block/$withoutdev/device/model" 2>&1)"
-      name="$(arcconf GETCONFIG 1 LD "$logical_nr" | grep "Logical device name" | sed 's/.*: \(.*\)/\1/g')"
-      [ -z "$name" ] && name="no name"
-      echo "# Adaptec RAID (LD $logical_nr): $name"
+      name="$(arcconf GETCONFIG 1 LD "$logical_nr" 2> /dev/null | grep 'Logical device name' | sed 's/.*: \(.*\)/\1/g')"
+      echo "# Adaptec RAID (LD $logical_nr): ${name:-no name}"
       ;;
     AMCC)
       logical_nr="$(find "/sys/block/$withoutdev/device/scsi_device/*" -maxdepth 0 -type d | cut -d: -f4)"
       echo "# 3ware RAID (LD $logical_nr)"
       ;;
-    ATA)
-      name="$(hdparm -i "$dev" | grep Model | sed 's/ Model=\(.*\), Fw.*/\1/g')"
-      echo "# Onboard: $name"
-      ;;
     *)
-      echo "# unknown"
-      ;;
+      local smartctl_json model_name serial_number
+      if ! smartctl_json="$(smartctl -i -j "$dev" 2> /dev/null)"; then
+        echo '# unknown'
+        return
+      fi
+      model_name="$(jq -r '.model_name // empty' <<< "$smartctl_json" 2> /dev/null)" || :
+      serial_number="$(disk_serial "$dev")" || :
+      echo "# Device Model: ${model_name:-unknown}, Serial Number: ${serial_number:-unknown}"
   esac
 }
 

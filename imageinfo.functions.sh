@@ -16,6 +16,11 @@ debian_bullseye_image() {
   ((IMG_VERSION >= 1100)) && ((IMG_VERSION <= 1200))
 }
 
+debian_bookworm_image() {
+  [[ "${IAM,,}" == 'debian' ]] || return 1
+  ((IMG_VERSION >= 1200)) && ((IMG_VERSION <= 1300))
+}
+
 other_image() {
   local image="$1"
   while read other_image; do
@@ -31,11 +36,16 @@ old_image() {
   [[ "${image%/*}" == "$(readlink -f "$OLDIMAGESPATH")" ]]
 }
 
+rhel_based_image() {
+  [[ "$IAM" == 'centos' ]] ||
+  [[ "$IAM" == 'rockylinux' ]] ||
+  [[ "$IAM" == 'almalinux' ]] ||
+  [[ "$IAM" == 'rhel' ]]
+}
+
 rhel_9_based_image() {
   [[ "$IAM" == 'centos' ]] && ((IMG_VERSION >= 90)) && ((IMG_VERSION != 610)) && return
-  [[ "$IAM" == 'rockylinux' ]] && ((IMG_VERSION >= 90)) && return
-  [[ "$IAM" == 'rhel' ]] && ((IMG_VERSION >= 90)) && return
-  [[ "$IAM" == 'almalinux' ]] && ((IMG_VERSION >= 90)) && return
+  rhel_based_image && ((IMG_VERSION >= 90)) && return
   return 1
 }
 
@@ -49,6 +59,16 @@ uses_network_manager() {
 
 debian_based_image() {
   [[ "$IAM" == 'debian' ]] || [[ "$IAM" == 'ubuntu' ]]
+}
+
+hwe_image() {
+  [[ "$IMAGE_FILE" =~ -hwe\. ]]
+}
+
+image_requires_xfs_version_check() {
+  [[ "$IAM" == 'ubuntu' ]] && ((IMG_VERSION <= 2004)) && return 0
+  [[ "$IAM" == 'debian' ]] && ((IMG_VERSION < 1100)) && return 0
+  return 1
 }
 
 # vim: ai:ts=2:sw=2:et
