@@ -31,6 +31,7 @@ export COMPANY_PUBKEY="$SCRIPTPATH/gpg/public-key.asc"
 export COMPANY_PUBKEYS=(
   "$COMPANY_PUBKEY"
   "$SCRIPTPATH/gpg/public-key-2018.asc"
+  "$SCRIPTPATH/gpg/public-key-2023.asc"
 )
 export COMPANY="Hetzner Online GmbH"
 export C_SHORT="hetzner"
